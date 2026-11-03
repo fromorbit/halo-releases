@@ -42,7 +42,7 @@ install.sh: installs halo and gets it running.
                                 (default $HALO_RELEASE_URL, else the version the channel points to)
   --channel stable|beta         which channel to follow (default stable; while there is no stable version the newest test version,
                                 said aloud). beta: the newest of stable and beta. Halo remembers it for `halo update`. The channels
-                                are named in kanalen.json of fromorbit/halo-releases ($HALO_KANALEN_URL, or --kanalen <https|file url>)
+                                are named in channels.json of fromorbit/halo-releases ($HALO_CHANNELS_URL, or --channels <https|file url>)
   --from <archive|folder|url>   an archive (.tar.gz), an unpacked folder or an https address; a SHA256SUMS next to an
                                 archive or address is required unless --no-verify
   --no-verify                   install an archive without a SHA256SUMS (you vouch for it)
@@ -93,13 +93,14 @@ main() {
   allow_root=0
   channel=stable
   channel_named=0
-  kanalen=""
+  channels=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --from) from="${2:?--from needs a value}"; shift 2 ;;
       --release) release="${2:?--release needs a value}"; release="${release%/}"; shift 2 ;;
       --channel) channel="${2:?--channel needs a value}"; channel_named=1; shift 2 ;;
-      --kanalen) kanalen="${2:?--kanalen needs a value}"; shift 2 ;;
+      --channels) channels="${2:?--channels needs a value}"; shift 2 ;;
+      --kanalen) channels="${2:?--kanalen needs a value}"; shift 2 ;; # the old name of --channels, kept for older commands (V-694)
       --prefix) prefix="${2:?--prefix needs a value}"; shift 2 ;;
       --mode) mode="${2:?--mode needs a value}"; shift 2 ;;
       --host) host="${2:?--host needs a value}"; shift 2 ;;
@@ -513,7 +514,7 @@ main() {
     here="$(cd "$(dirname "$0")" && pwd)"
   fi
   # one command from nothing: no archive given and none next to this script, so the release the channel points to
-  # (kanalen.json of fromorbit/halo-releases; the repository of the code is private and `latest` skips pre-releases)
+  # (channels.json of fromorbit/halo-releases; the repository of the code is private and `latest` skips pre-releases)
   via_channel=0
   if [ -z "$from" ] && [ -z "$release" ]; then
     if [ -n "$here" ] && { { [ -x "$here/halo" ] && [ -d "$here/ui" ]; } || ls "$here"/halo-*-"$plat".tar.gz >/dev/null 2>&1; }; then :; else
@@ -521,7 +522,8 @@ main() {
         release="${HALO_RELEASE_URL%/}"
       else
         via_channel=1
-        kanalen="${kanalen:-${HALO_KANALEN_URL:-https://raw.githubusercontent.com/fromorbit/halo-releases/main/kanalen.json}}"
+        # HALO_KANALEN_URL is the old name of HALO_CHANNELS_URL, still honoured (V-694)
+        channels="${channels:-${HALO_CHANNELS_URL:-${HALO_KANALEN_URL:-https://raw.githubusercontent.com/fromorbit/halo-releases/main/channels.json}}}"
       fi
     fi
   fi
@@ -537,11 +539,11 @@ main() {
     esac
   }
   [ -z "$release" ] || checkurl "$release" release
-  [ "$via_channel" = 0 ] || checkurl "$kanalen" kanalen
+  [ "$via_channel" = 0 ] || checkurl "$channels" channels
   case "$from" in *://*) checkurl "$from" from ;; esac
   protos='=https'
   [ "$insecure" = 0 ] || protos='=https,http'
-  case "$from$release$kanalen${HALO_RELEASES_BASE:-}" in file://*) protos='=https,file' ;; esac
+  case "$from$release$channels${HALO_RELEASES_BASE:-}" in file://*) protos='=https,file' ;; esac
   fetch() { # <url> <curl options...>; with dl_hdr set, the headers of the response go there too (how big a download is)
     if [ -n "$dl_hdr" ]; then curl -fsSL --proto "$protos" --proto-redir '=https' --tlsv1.2 -D "$dl_hdr" "$@"
     else curl -fsSL --proto "$protos" --proto-redir '=https' --tlsv1.2 "$@"; fi
@@ -553,7 +555,7 @@ main() {
   for tool in tar gzip "${sha%% *}"; do
     command -v "$tool" >/dev/null 2>&1 || { echo "install.sh: $tool is missing (Ubuntu: sudo apt install coreutils tar gzip)" >&2; exit 1; }
   done
-  case "$from$release$kanalen" in
+  case "$from$release$channels" in
     *://*) command -v curl >/dev/null 2>&1 || { echo "install.sh: curl is needed for an address (Ubuntu: sudo apt install curl)" >&2; exit 1; } ;;
   esac
 
@@ -611,14 +613,30 @@ main() {
   channel_note=""
   # the channel: which version it points to (a small JSON file; no jq needed), and then that version's own release folder
   if [ "$via_channel" = 1 ]; then
-    fetch "$kanalen" -o "$work/kanalen.json" || die 1 "install.sh: could not fetch $kanalen. Check the connection, or give a release folder: --release <https url>"
-    flat="$(tr -d '\n\r' < "$work/kanalen.json")"
-    printf '%s\n' "$flat" | grep -Eq '^[[:space:]]*\{[[:space:]]*"schema"[[:space:]]*:[[:space:]]*1[[:space:]]*,[[:space:]]*"stable"[[:space:]]*:[[:space:]]*(null|"[^"]*")[[:space:]]*,[[:space:]]*"beta"[[:space:]]*:[[:space:]]*(null|"[^"]*")[[:space:]]*\}[[:space:]]*$' || die 1 "install.sh: $kanalen is not a kanalen.json (schema 1)"
+    # channels.json first. When that cannot be fetched or is no channels.json, the old name next to it, kanalen.json: a
+    # release repository that has only the old file keeps working (V-694). The publisher writes both with the same bytes.
+    channels_get() { # <url> <quiet 0|1>: 0 read into $flat, 1 not fetched, 2 not a channels.json of schema 1
+      if [ "$2" = 1 ]; then fetch "$1" -o "$work/channels.json" 2>/dev/null || return 1
+      else fetch "$1" -o "$work/channels.json" || return 1; fi
+      flat="$(tr -d '\n\r' < "$work/channels.json")"
+      printf '%s\n' "$flat" | grep -Eq '^[[:space:]]*\{[[:space:]]*"schema"[[:space:]]*:[[:space:]]*1[[:space:]]*,[[:space:]]*"stable"[[:space:]]*:[[:space:]]*(null|"[^"]*")[[:space:]]*,[[:space:]]*"beta"[[:space:]]*:[[:space:]]*(null|"[^"]*")[[:space:]]*\}[[:space:]]*$' || return 2
+    }
+    legacy=""
+    case "$channels" in */channels.json) legacy="${channels%channels.json}kanalen.json" ;; esac
+    ch_rc=0
+    if [ -n "$legacy" ]; then channels_get "$channels" 1 || ch_rc=$?; else channels_get "$channels" 0 || ch_rc=$?; fi
+    if [ "$ch_rc" != 0 ] && [ -n "$legacy" ]; then
+      legacy_rc=0
+      channels_get "$legacy" 1 || legacy_rc=$?
+      [ "$legacy_rc" != 0 ] || { channels="$legacy"; ch_rc=0; }
+    fi
+    [ "$ch_rc" != 1 ] || die 1 "install.sh: could not fetch $channels. Check the connection, or give a release folder: --release <https url>"
+    [ "$ch_rc" = 0 ] || die 1 "install.sh: $channels is not a channels.json (schema 1)"
     jsonfield() { printf '%s' "$flat" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"; }
     stable_v="$(jsonfield stable)"; beta_v="$(jsonfield beta)"
     for v in "$stable_v" "$beta_v"; do
-      case "$v" in ""|[0-9]*.[0-9]*.[0-9]*) ;; *) die 1 "install.sh: $kanalen names a version that is none: $v" ;; esac
-      case "$v" in *[!0-9A-Za-z.+-]*) die 1 "install.sh: $kanalen names a version that is none: $v" ;; esac
+      case "$v" in ""|[0-9]*.[0-9]*.[0-9]*) ;; *) die 1 "install.sh: $channels names a version that is none: $v" ;; esac
+      case "$v" in *[!0-9A-Za-z.+-]*) die 1 "install.sh: $channels names a version that is none: $v" ;; esac
     done
     picked=""
     if [ "$channel" = beta ]; then
@@ -628,7 +646,7 @@ main() {
       picked="$beta_v"; channel=beta
       channel_note="Note: there is no stable version yet; the newest test version ($beta_v) is installed. Choose with --channel stable|beta."
     fi
-    [ -n "$picked" ] || die 1 "install.sh: there is no version on the channel $channel yet (kanalen.json). Try --channel beta, or give --release <https url>."
+    [ -n "$picked" ] || die 1 "install.sh: there is no version on the channel $channel yet (channels.json). Try --channel beta, or give --release <https url>."
     release="${HALO_RELEASES_BASE:-https://github.com/fromorbit/halo-releases/releases/download}/v$picked"
     checkurl "$release" release
     ver="$picked"
