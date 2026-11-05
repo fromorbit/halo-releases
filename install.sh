@@ -4,6 +4,7 @@
 # on macOS) and, with accounts, the owner.
 #
 #   curl -fsSL https://raw.githubusercontent.com/fromorbit/halo-releases/main/install.sh | sh    # on a terminal: a short guided setup
+#                                                                    # (the mode, network by default; again: keep or switch)
 #   curl -fsSL https://raw.githubusercontent.com/fromorbit/halo-releases/main/install.sh | sh -s -- --mode server --host 192-168-1-50.sslip.io --owner mike
 #   HALO_OWNER_PASSWORD=... sh install.sh --mode server --host halo.example.com --owner mike --yes   # no questions
 #
@@ -19,8 +20,10 @@ install.sh: installs halo and gets it running.
   curl -fsSL https://raw.githubusercontent.com/fromorbit/halo-releases/main/install.sh | sh -s -- --mode server --host <domain> --owner <name>
 
   --mode local|network|server   how Halo runs. On a terminal without --mode, --host, --public-url, --owner and --yes a guided
-                                setup asks it (three questions, Enter takes the default: this computer only). Otherwise the
-                                default is local, said aloud; an existing installation keeps its mode.
+                                setup asks it (Enter takes the default: network, this computer and others on the network,
+                                with accounts; then the address and the owner). An existing installation is shown with its
+                                mode, to keep (Enter) or to switch. Otherwise the default is local, said aloud; an existing
+                                installation keeps its mode.
                                 A team: --mode server --host <domain> (or --public-url https://<domain> behind Caddy)
   --host <domain>               base domain of the addresses of spaces (server: required). No domain of your own:
                                 <ip-with-dashes>.sslip.io, for example 192-168-1-50.sslip.io (wildcard DNS to that IP)
@@ -58,14 +61,15 @@ A full install happens when there is a terminal, or --yes, --mode or --with-engi
 the UI are installed and `halo init --mode local` is run once. Without a terminal nothing is asked: what is missing stops the
 script at once with the line that fixes it (exit 2), and sudo that needs a password stops it too (exit 1: use ssh -t, or sudo
 without a password for this user). Every command that runs as root (packages, linger, subuids, the system unit) is
-shown before it runs, from `halo doctor --root-plan`, and only those run. Each step is one line; what its commands print goes to ~/.halo/install.log (in
+shown before it runs, from `halo doctor --root-plan`, and only those run. With accounts the guided setup ends with one
+question: link this Halo to Orbit (fromorbit.dev, `halo orbit pair`)? Each step is one line; what its commands print goes to ~/.halo/install.log (in
 $HALO_DATA_DIR when that is set), and a step that fails shows the last lines of it. Only a terminal gets the logo, colour
 (not with NO_COLOR) and a little motion (HALO_NO_ANIM=1 keeps it all still; never in CI, which gets the plain title).
 The checksum protects against a damaged download, not against a hostile source: trust is in https and in the
 release folder. Needs tar, gzip, sha256sum, curl, and sudo for the engine.
 
-macOS (Apple Silicon or Intel): Halo is for this computer (mode local, the default; nothing is asked) or the local network
-(--mode network); a team server runs on Linux, so --mode server, --host, --public-url and --owner stop at once. Nothing
+macOS (Apple Silicon or Intel): Halo is for this computer (mode local) or the local network (mode network, the default of
+the guided setup; without a terminal local); a team server runs on Linux, so --mode server, --host, --public-url and --owner stop at once. Nothing
 runs with sudo: halo doctor --fix installs the engine with Homebrew (it names the commands and asks first; --yes passes
 on) and the service is a LaunchAgent (~/Library/LaunchAgents/com.fromorbit.halo.plist). The checksum is shasum -a 256.
 EOF
@@ -82,6 +86,10 @@ main() {
   public_url=""
   yes=0
   engine=auto
+  engine_named=0
+  switch_from=""
+  orbit_row=""
+  tty_eof=0
   with_engine=0
   no_engine=0
   images=core
@@ -105,7 +113,7 @@ main() {
       --mode) mode="${2:?--mode needs a value}"; shift 2 ;;
       --host) host="${2:?--host needs a value}"; shift 2 ;;
       --public-url) public_url="${2:?--public-url needs a value}"; shift 2 ;;
-      --engine) engine="${2:?--engine needs a value}"; shift 2 ;;
+      --engine) engine="${2:?--engine needs a value}"; engine_named=1; shift 2 ;;
       --images) images="${2:?--images needs a value}"; shift 2 ;;
       --owner) owner="${2:?--owner needs a value}"; shift 2 ;;
       --yes|-y) yes=1; shift ;;
@@ -363,7 +371,8 @@ main() {
   ask() { # <question> <default>: one line from the terminal; Enter, or the end of the input, takes the default
     if [ -n "$2" ]; then printf '%s %s[%s]%s ' "$1" "$D" "$2" "$N" > /dev/tty; else printf '%s ' "$1" > /dev/tty; fi
     eof=0
-    if ! IFS= read -r answer < /dev/tty; then eof=1; answer=""; printf '\n' > /dev/tty; fi
+    # after the end of the input (Ctrl-D) every later question takes its default too, without waiting for a second one
+    if [ "$tty_eof" = 1 ] || ! IFS= read -r answer < /dev/tty; then eof=1 tty_eof=1; answer=""; printf '\n' > /dev/tty; fi
     answer="$(printf '%s' "$answer" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
     [ -n "$answer" ] || answer="$2"
   }
@@ -466,12 +475,12 @@ main() {
     have_host="$(grep -o '"host": *"[^"]*"' "$data/install.json" | cut -d'"' -f4 || true)"
   fi
 
-  # A person at a terminal who said nothing about the mode is asked three things, each with a default, so Enter, Enter, Enter
-  # installs it (V-689). With any of those flags, or without a terminal, nothing is asked (V-116). On a Mac the one real
-  # answer is this computer (a team server runs on Linux), so nothing is asked: mode local.
-  if [ "$full" = 1 ] && [ "$tty" = 1 ] && [ "$init" = 1 ] && [ -z "$have_mode" ] && [ "$yes" = 0 ] &&
-    [ -z "$mode$host$public_url$owner" ]; then
-    if [ "$os" = darwin ]; then mode=local; else guided; fi
+  # A person at a terminal who said nothing about the mode is asked it, network by default, and for an accounts mode the
+  # address and the owner, each with a default, so Enter, Enter, Enter installs it (V-689, V-714). An installation that
+  # exists is shown with its mode, to keep (Enter) or to switch. With any of those flags, or without a terminal, nothing is
+  # asked (V-116). On a Mac a team server is not offered (V-690).
+  if [ "$full" = 1 ] && [ "$tty" = 1 ] && [ "$init" = 1 ] && [ "$yes" = 0 ] && [ -z "$mode$host$public_url$owner" ]; then
+    guided
   fi
   eff_mode="${have_mode:-${mode:-local}}"
 
@@ -494,6 +503,8 @@ main() {
     if [ "$os" = linux ] && [ "$(id -u)" != 0 ] && command -v sudo >/dev/null 2>&1; then
       [ "$no_engine" = 1 ] || need_sudo=1
       { [ "$eff_mode" = local ] || [ "$no_service" = 1 ]; } || need_sudo=1
+      # a switch away from a system unit removes it first
+      [ -z "$switch_from" ] || [ ! -f /etc/systemd/system/halo.service ] || need_sudo=1
     fi
     if [ "$need_sudo" = 1 ] && ! sudo -n true 2>/dev/null; then
       if [ "$tty" = 1 ]; then
@@ -716,10 +727,11 @@ main() {
       else
         case "$eff_mode" in
           local) for_line="this computer only (mode local)" ;;
-          network) for_line="the local network (mode network)" ;;
+          network) for_line="the local network (mode network${host:+, $host}${owner:+, owner $owner})" ;;
           *) for_line="a team server at ${public_url:-$host}${owner:+, owner $owner}" ;;
         esac
       fi
+      [ -z "$switch_from" ] || for_line="$for_line, switched from mode $switch_from"
       printf '  For      %s\n' "$for_line"
     fi
     [ "$log_keep" = 0 ] || printf '  Log      %s\n' "$log"
@@ -785,7 +797,7 @@ main() {
       ok "local (this computer only)"
       note "Note: no --mode and no terminal to ask on: mode local (this computer only). Choose again with: halo init --mode ${modes#local|} --force"
     fi
-    printf '\nNext: halo serve (or open the Halo app, which starts it). For the engine, images and a service: halo doctor --fix\n'
+    next_line
     return 0
   fi
 
@@ -804,16 +816,22 @@ main() {
     [ -n "$mode" ] || { mode=local; said_local=1; }
     step Mode
     set -- init --mode "$mode" --engine "$engine"
+    # a switch (V-714): the service of the old mode goes first, and init keeps the engine, git and the bind of what is there
+    if [ -n "$switch_from" ]; then
+      service_off
+      set -- init --mode "$mode" --force
+      [ "$engine_named" = 0 ] || set -- "$@" --engine "$engine"
+    fi
     [ -z "$host" ] || set -- "$@" --host "$host"
     [ -z "$public_url" ] || set -- "$@" --public-url "$public_url"
     quiet "$halo" "$@"
     case "$mode" in
-      local) ok "local (this computer only)" ;;
+      local) ok "local (this computer only)${switch_from:+ (was $switch_from)}" ;;
       *)
         # the address as halo init chose it when none was given (network: the LAN address as <ip>.sslip.io)
         where="${public_url:-$host}"
         [ -n "$where" ] || where="$(grep -o '"host": *"[^"]*"' "$data/install.json" 2>/dev/null | cut -d'"' -f4 || true)"
-        ok "$mode, $where" ;;
+        ok "$mode, $where${switch_from:+ (was $switch_from)}" ;;
     esac
     if [ "$said_local" = 1 ] && [ "$os" = darwin ]; then note "Mode: local (this computer only). For the local network: --mode network"
     elif [ "$said_local" = 1 ]; then note "Mode: local (this computer only). For a team server: --mode server --host <domain>"; fi
@@ -892,42 +910,55 @@ main() {
     skip "not made: this Halo has no accounts"
   fi
 
-  # 7. the last lines: where to open Halo and what to do first
+  # 7. Orbit (fromorbit.dev): with accounts a person at the terminal is asked once to link this Halo to a team there; the
+  # outcome, or how to do it later, goes in the summary (V-714)
+  orbit_link
+
+  # 8. the last lines: where to open Halo and what to do first
   summary
 }
 
-# The guided setup (V-689): for whom, and for a server its domain and the owner. Every question has a default.
+# The guided setup (V-689, V-714): which mode (network by default; on a Mac no team server), and for a mode with accounts
+# the address and the owner. An installation that exists is shown with its mode, the default: Enter keeps it, another
+# number switches (`switch_from`; the Mode step removes the old service and runs init --force). Every question has a default.
 guided() {
   title
   printf '\n'
-  printf 'Who is Halo for?\n  1) this computer only\n  2) a team: a server that other people open over the network\n' > /dev/tty
-  while :; do
-    ask 'Choose' 1
-    case "$answer" in 1|2) break ;; esac
-    printf '  Type 1 or 2.\n' > /dev/tty
+  now=0
+  case "$have_mode" in local) now=1 ;; network) now=2 ;; server) now=3 ;; esac
+  last=3
+  [ "$os" = linux ] || last=2
+  if [ "$now" = 0 ]; then printf 'Who is Halo for?\n' > /dev/tty
+  else printf 'Halo is installed here in mode %s%s. Keep it (Enter) or switch:\n' "$have_mode" "${have_host:+ at $have_host}" > /dev/tty; fi
+  k=1
+  for what in 'only this computer (local)' 'this computer and others on the network, with accounts (network)' \
+    'a team server with its own domain, with accounts (server)'; do
+    if [ "$k" -le "$last" ]; then
+      if [ "$k" = "$now" ]; then printf '  %s) %s  %s<- now%s\n' "$k" "$what" "$D" "$N" > /dev/tty
+      else printf '  %s) %s\n' "$k" "$what" > /dev/tty; fi
+    fi
+    k=$((k + 1))
   done
-  if [ "$answer" = 1 ]; then
-    mode=local
+  [ "$last" = 3 ] || printf '  %s(a team server runs on Linux)%s\n' "$D" "$N" > /dev/tty
+  def=2
+  [ "$now" = 0 ] || def="$now"
+  while :; do
+    ask 'Choose' "$def"
+    case "$answer" in 1|2) break ;; 3) [ "$last" = 2 ] || break ;; esac
+    printf '  Type a number from 1 to %s.\n' "$last" > /dev/tty
+  done
+  case "$answer" in 1) pick=local ;; 2) pick=network ;; *) pick=server ;; esac
+  if [ "$now" != 0 ]; then
+    if [ "$pick" = "$have_mode" ]; then printf '\n' > /dev/tty; return 0; fi # kept: the Mode step says it stays
+    switch_from="$have_mode" have_mode="" have_host=""
+  fi
+  mode="$pick"
+  if [ "$mode" = local ]; then
     printf '\n' > /dev/tty
     return 0
   fi
-  mode=server
-  ip="$(lan_ip)"
-  suggest=""
-  [ -z "$ip" ] || suggest="$(printf '%s' "$ip" | tr . -).sslip.io"
-  printf '\nThe domain of the server: every space gets an address under it (<space>.<domain>), so <domain> and *.<domain>\nmust point to this computer. No domain of your own? <ip-with-dashes>.sslip.io is wildcard DNS for an IP.\n' > /dev/tty
-  [ -z "$ip" ] || printf 'The proposal is the LAN address of this computer (%s). On a cloud VM behind NAT, type its public IP or your domain.\n' "$ip" > /dev/tty
-  while :; do
-    ask 'Domain' "$suggest"
-    host="$(printf '%s' "$answer" | tr 'A-Z' 'a-z' | sed 's#^[a-z]*://##; s#/*$##')"
-    # an IP is turned into its sslip.io name, so the addresses of the spaces work too
-    if printf '%s' "$host" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then host="$(printf '%s' "$host" | tr . -).sslip.io"; fi
-    if printf '%s' "$host" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'; then
-      case "$host" in localhost|*.localhost) ;; *) break ;; esac
-    fi
-    [ "$eof" = 0 ] || die 2 "install.sh: a server needs its own domain. Run: sh install.sh --mode server --host <domain> (no domain of your own: --host <ip-with-dashes>.sslip.io, for example 192-168-1-50.sslip.io)"
-    printf '  A domain is a name like halo.example.com (letters, digits, dashes and dots).\n' > /dev/tty
-  done
+  # a Mac finds its LAN address itself (halo init), and --host is no flag there (V-690)
+  [ "$os" = darwin ] || ask_host
   me="$(printf '%s' "${USER:-$(id -un 2>/dev/null || true)}" | tr 'A-Z' 'a-z')"
   printf '%s' "$me" | grep -Eq '^[a-z0-9][a-z0-9._-]{1,31}$' || me=""
   printf '\nThe owner: the first account, who adds the others. Its password is asked at the end.\n' > /dev/tty
@@ -940,6 +971,110 @@ guided() {
     printf '  A name is 2 to 32 of a-z, 0-9, dot, dash and underscore, starting with a letter or digit.\n' > /dev/tty
   done
   printf '\n' > /dev/tty
+}
+
+# The address of a mode with accounts: for a server its domain, for the network this computer's address on it. The proposal
+# is the LAN address as <ip-with-dashes>.sslip.io; a typed IP becomes its sslip.io name. The network may go without one
+# (halo init then says what it chose); a server may not.
+ask_host() {
+  ip="$(lan_ip)"
+  suggest=""
+  [ -z "$ip" ] || suggest="$(printf '%s' "$ip" | tr . -).sslip.io"
+  if [ "$mode" = server ]; then
+    q=Domain
+    printf '\nThe domain of the server: every space gets an address under it (<space>.<domain>), so <domain> and *.<domain>\nmust point to this computer. No domain of your own? <ip-with-dashes>.sslip.io is wildcard DNS for an IP.\n' > /dev/tty
+    [ -z "$ip" ] || printf 'The proposal is the LAN address of this computer (%s). On a cloud VM behind NAT, type its public IP or your domain.\n' "$ip" > /dev/tty
+  else
+    q=Address
+    printf '\nThe address of this computer on the network: Halo opens at it and every space under it (<space>.<address>).\n<ip-with-dashes>.sslip.io is wildcard DNS for an IP, so no DNS of your own is needed.\n' > /dev/tty
+    [ -z "$ip" ] || printf 'The proposal is the LAN address of this computer (%s).\n' "$ip" > /dev/tty
+    # WSL 2 in its default (NAT) network has an address of its own that the rest of the network cannot reach
+    if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+      printf 'This is WSL: other computers reach it only with mirrored networking (networkingMode=mirrored in .wslconfig on\nWindows; then the proposal is the address of Windows), or type the address of Windows with a port forward.\n' > /dev/tty
+    fi
+  fi
+  while :; do
+    ask "$q" "$suggest"
+    host="$(printf '%s' "$answer" | tr 'A-Z' 'a-z' | sed 's#^[a-z]*://##; s#/*$##')"
+    # the network without a proposal and without an answer: halo init chooses
+    [ -n "$host" ] || [ "$mode" = server ] || break
+    # an IP is turned into its sslip.io name, so the addresses of the spaces work too
+    if printf '%s' "$host" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then host="$(printf '%s' "$host" | tr . -).sslip.io"; fi
+    if printf '%s' "$host" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'; then
+      case "$host" in localhost|*.localhost) ;; *) break ;; esac
+    fi
+    [ "$eof" = 0 ] || [ "$mode" = network ] || die 2 "install.sh: a server needs its own domain. Run: sh install.sh --mode server --host <domain> (no domain of your own: --host <ip-with-dashes>.sslip.io, for example 192-168-1-50.sslip.io)"
+    [ "$eof" = 0 ] || { host=""; break; }
+    printf '  A domain is a name like halo.example.com (letters, digits, dashes and dots).\n' > /dev/tty
+  done
+}
+
+# Before a switch (V-714): the service of the old mode stops and goes, so the new mode installs its own (a user unit for
+# local, a system unit for network and server, a LaunchAgent on a Mac) and starts in it; the doctor's repair does that,
+# with its root commands shown as always. A system unit needs root to go: its three commands are shown and asked first.
+service_off() {
+  if [ "$os" = linux ] && [ -f /etc/systemd/system/halo.service ]; then
+    break_line
+    printf '      The service of mode %s is a system unit; to switch it is stopped and removed. These commands run as root (sudo):\n' "$switch_from" > /dev/tty
+    printf '         sudo systemctl disable --now halo.service\n         sudo rm -f /etc/systemd/system/halo.service\n         sudo systemctl daemon-reload\n' > /dev/tty
+    if ! consent Y; then
+      finish "$R" "$m_no" "not approved: the mode stays $switch_from"
+      printf 'install.sh: the root commands did not run, so the mode stays %s. halo is installed in %s.\n' "$switch_from" "$halo" >&2
+      printf 'To switch by hand: sudo systemctl disable --now halo.service; sudo rm -f /etc/systemd/system/halo.service; %s init --mode %s --force; %s doctor --fix\n' "$halo" "$mode" "$halo" >&2
+      exit 1
+    fi
+    resume
+    quiet sudo systemctl disable --now halo.service || die 1 "install.sh: could not stop the service; the mode stays $switch_from. Try: sudo systemctl disable --now halo.service"
+    quiet sudo rm -f /etc/systemd/system/halo.service
+    quiet sudo systemctl daemon-reload || :
+  else
+    quiet "$halo" service remove || die 1 "install.sh: could not stop the service of mode $switch_from; the mode stays. See: $halo service status"
+  fi
+}
+
+# Orbit (fromorbit.dev), once Halo answers and the owner exists (V-714): with accounts, at a terminal and without --yes, one
+# question; yes runs `halo orbit pair` on the terminal (its code and link are shown there and kept for the summary). No, no
+# terminal, --yes or mode local: the summary says how to do it later.
+orbit_link() {
+  if [ "$accounts" != on ]; then
+    orbit_row="needs accounts: install again, choose network"
+    return 0
+  fi
+  case ":$PATH:" in *":$prefix/bin:"*) oh=halo ;; *) oh="$halo" ;; esac
+  orbit_row="not linked; later: $oh orbit pair"
+  st="$("$halo" orbit status --json 2>/dev/null | tr -d '\n')" || st=""
+  if printf '%s' "$st" | grep -q '"state": *"paired"'; then orbit_row="linked (see: halo orbit status)"; return 0; fi
+  [ "$tty" = 1 ] && [ "$yes" = 0 ] || return 0
+  printf '\n' > /dev/tty
+  ask 'Link this Halo to a team on Orbit (fromorbit.dev)?' 'Y/n'
+  [ "$eof" = 0 ] || return 0
+  case "$answer" in Y/n|[Yy]|[Yy][Ee][Ss]|[Jj]|[Jj][Aa]) ;; *) return 0 ;; esac
+  # its own words on the terminal (also when the output goes to a file), the code read back for the summary
+  if "$halo" orbit pair < /dev/tty > /dev/tty 2>&1; then
+    st="$("$halo" orbit status --json 2>/dev/null | tr -d '\n')" || st=""
+    code="$(printf '%s' "$st" | sed -n 's/.*"userCode": *"\([^"]*\)".*/\1/p')"
+    at="$(printf '%s' "$st" | sed -n 's/.*"verificationUri": *"\([^"]*\)".*/\1/p')"
+    if [ -n "$code" ]; then orbit_row="approve code $code at ${at:-https://fromorbit.dev}"
+    else orbit_row="pairing started; see: $oh orbit status"; fi
+  else
+    orbit_row="not linked (the reason is above); try again: $oh orbit pair"
+  fi
+  printf '\n'
+}
+
+# The end without a full install: what to do next. A Halo that already runs as a service (or by hand) is never told to
+# start with halo serve; it runs the old program until it restarts.
+next_line() {
+  run=""
+  if [ "$os" = darwin ] && [ -f "$agent" ]; then run="launchctl kickstart -k gui/$(id -u)/com.fromorbit.halo"
+  elif [ -f /etc/systemd/system/halo.service ]; then run="sudo systemctl restart halo.service"
+  elif [ -f "$unit" ]; then run="systemctl --user restart halo.service"
+  fi
+  if [ -n "$run" ]; then
+    printf '\nNext: Halo runs as a service; restart it to run this version: %s\n' "$run"
+  else
+    printf '\nNext: halo serve (or open the Halo app, which starts it). For the engine, images and a service: halo doctor --fix\n'
+  fi
 }
 
 # The LAN IPv4 of this computer: HALO_LAN_IP (as halo init has it), the source address of the default route (a lookup in
@@ -1130,10 +1265,12 @@ summary() {
   printf '\n'
   case "$install_mode" in
     local|"")
-      card 'this computer only' 'Open Halo:' 'http://127.0.0.1:7788' 'First workspace:' 'halo repo scan <folder with your app>' && return 0
+      card 'this computer only' 'Open Halo:' 'http://127.0.0.1:7788' 'First workspace:' 'halo repo scan <folder with your app>' \
+        'Orbit:' "$orbit_row" && return 0
       printf '%s%s%s %sHalo is running (this computer only).%s\n\n' "$G" "$m_ok" "$N" "$B" "$N"
       row 'Open Halo:' 'http://127.0.0.1:7788'
       row 'First workspace:' 'halo repo scan <folder with your app>'
+      row 'Orbit:' "$orbit_row"
       return 0 ;;
   esac
   public="$(grep -o '"publicUrl": *"[^"]*"' "$data/install.json" 2>/dev/null | cut -d'"' -f4 || true)"
@@ -1146,9 +1283,10 @@ summary() {
     mkdir -p "$data/caddy"
     if caddy="$("$halo" caddyfile --out "$data/caddy/Caddyfile" 2>&1)"; then caddy_ok=1; else caddy_ok=0; fi
   fi
-  if card "$install_mode, accounts on" 'Open Halo:' "$url"; then printf '\n'; else
+  if card "$install_mode, accounts on" 'Open Halo:' "$url" 'Orbit:' "$orbit_row"; then printf '\n'; else
     printf '%s%s%s %sHalo is running (%s, accounts on).%s\n\n' "$G" "$m_ok" "$N" "$B" "$install_mode" "$N"
     row 'Open Halo:' "$url"
+    row 'Orbit:' "$orbit_row"
   fi
   row 'In the Halo app:' "Host toevoegen (add host) > $url"
   if [ -n "$public" ] && [ "${public#https://}" != "$public" ]; then
@@ -1185,18 +1323,21 @@ summary() {
 # border in it, and the address is a link where the terminal is known to open one (OSC 8). A mint satellite goes once
 # round the card and stays on top. False, with nothing drawn, without a terminal, in CI, or when the card is wider than
 # the terminal: then the summary is the lines it always was.
-card() { # <what runs> <label> <value> [<label> <value>]
+card() { # <what runs> <label> <value> [<label> <value> [<label> <value>]]
   [ "$logo" = 1 ] || return 1
   head="$m_ok Halo is running ($1)."
-  l1="$2" v1="$3" l2="${4:-}" v2="${5:-}"
+  l1="$2" v1="$3" l2="${4:-}" v2="${5:-}" l3="${6:-}" v3="${7:-}"
+  [ -n "$v2" ] || l2=""
+  [ -n "$v3" ] || l3=""
   iw="$(wid "$head")"
-  for v in "$v1" "$v2"; do # a row is two spaces, the label in 18 and the value
+  for v in "$v1" "$v2" "$v3"; do # a row is two spaces, the label in 18 and the value
     [ -n "$v" ] || continue
     w=$((20 + $(wid "$v")))
     [ "$w" -le "$iw" ] || iw="$w"
   done
   cw=$((iw + 6)) ch=7 # lines: the border, a blank, the headline, a blank, the rows, a blank, the border
-  [ -z "$l2" ] || ch=8
+  [ -z "$l2" ] || ch=$((ch + 1))
+  [ -z "$l3" ] || ch=$((ch + 1))
   [ "$cw" -le "$wide" ] || return 1
   if [ "$utf" = 1 ]; then tl='╭' tr='╮' bl='╰' br='╯' hz='─' vt='│' sat='•'; else tl='+' tr='+' bl='+' br='+' hz='-' vt='|' sat='o'; fi
   osc8=0
@@ -1214,8 +1355,8 @@ card() { # <what runs> <label> <value> [<label> <value>]
   inside '' 0
   inside "$G$m_ok$N $B${head#"$m_ok "}$N" "$(wid "$head")"
   inside '' 0
-  for k in 1 2; do
-    if [ "$k" = 1 ]; then l="$l1" v="$v1"; else l="$l2" v="$v2"; fi
+  for k in 1 2 3; do
+    case "$k" in 1) l="$l1" v="$v1" ;; 2) l="$l2" v="$v2" ;; *) l="$l3" v="$v3" ;; esac
     [ -n "$l" ] || continue
     pad="$(printf '%-18s' "$l")"
     case "$v" in
